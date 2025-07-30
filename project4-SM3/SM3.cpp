@@ -215,7 +215,7 @@ double timeFunction(F func, Args&&... args) {
 }
 
 int main() {
-    string test_msg = "The quick brown fox jumps over the lazy dog";
+    string test_msg = "AAAAAAAAA";
 
     vector<uint8_t> msg(test_msg.begin(), test_msg.end());
 
