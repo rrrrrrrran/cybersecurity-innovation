@@ -6,16 +6,6 @@
 #include <random>
 using namespace std;
 
-void print_m128i_hex(__m128i var) { // print function of __m128i with little-endian byte order
-    alignas(16) unsigned char bytes[16];
-    _mm_store_si128((__m128i*)bytes, var); 
-    std::cout << "0x";
-    for (int i = 15; i >= 0; --i) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)bytes[i];
-    }
-    std::cout << std::dec << std::endl;
-}
-
 const uint8_t Sbox[256] = { // Sbox of SM4
     0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7,0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
     0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3,0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
@@ -127,37 +117,108 @@ void SM4_dec(__m128i& c, __m128i k) { //decryption function of SM4
     }
     c = _mm_shuffle_epi32(c, _MM_SHUFFLE(0, 1, 2, 3));
 }
-__m128i random_m128i() {
-    static random_device rd;
-    static mt19937 gen(rd()); 
-    static uniform_int_distribution<uint32_t> dis(0, 0xFFFFFFFF);
 
-    return _mm_set_epi32(dis(gen), dis(gen), dis(gen), dis(gen));
+// GCM上下文结构体
+struct SM4GCMContext {
+    __m128i key;
+    __m128i iv;
+    uint64_t counter;
+};
+uint64_t bswap64(uint64_t x) {
+    return ((x & 0x00000000000000FFULL) << 56) |
+        ((x & 0x000000000000FF00ULL) << 40) |
+        ((x & 0x0000000000FF0000ULL) << 24) |
+        ((x & 0x00000000FF000000ULL) << 8) |
+        ((x & 0x000000FF00000000ULL) >> 8) |
+        ((x & 0x0000FF0000000000ULL) >> 24) |
+        ((x & 0x00FF000000000000ULL) >> 40) |
+        ((x & 0xFF00000000000000ULL) >> 56);
 }
-int main()
-{
-    __m128i m = random_m128i();
-    __m128i k = random_m128i();
-    __m128i c = m;
-    auto start = std::chrono::high_resolution_clock::now();
-    SM4_enc(c, k);
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+// Counter Block 构造函数
+__m128i get_counter_block(const __m128i& iv, uint64_t counter) {
+    alignas(16) uint8_t block[16];
+    _mm_store_si128((__m128i*)block, iv); // 拷贝 IV
+    uint64_t* ctr_ptr = reinterpret_cast<uint64_t*>(block + 8);
+    *ctr_ptr = bswap64(counter); // GCM 中高 64 位是 nonce，低 64 位是大端计数器
+    return _mm_load_si128((__m128i*)block);
+}
 
-    __m128i dec_m = c;
-    auto start1 = std::chrono::high_resolution_clock::now();
-    SM4_dec(dec_m, k);
-    auto end1 = std::chrono::high_resolution_clock::now();
-    auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1);
+// GCM加密
+void SM4_GCM_encrypt(vector<__m128i>& ciphertext,
+    const vector<__m128i>& plaintext,
+    const SM4GCMContext& ctx) {
+    ciphertext.resize(plaintext.size());
+    for (size_t i = 0; i < plaintext.size(); ++i) {
+        __m128i ctr_blk = get_counter_block(ctx.iv, ctx.counter + i + 1);
+        SM4_enc(ctr_blk, ctx.key); // 加密counter block
+        ciphertext[i] = _mm_xor_si128(plaintext[i], ctr_blk);
+    }
+}
 
-    cout << "明文：";
-    print_m128i_hex(m);
-    cout << "密钥：";
-    print_m128i_hex(k);
-    cout << "密文：";
-    print_m128i_hex(c);
-    cout << "加密耗时: " << duration.count() << " 微秒" << endl;
-    cout << "解密：";
-    print_m128i_hex(dec_m);
-    cout << "解密耗时: " << duration.count() << " 微秒" << endl;
+// GCM解密
+void SM4_GCM_decrypt(vector<__m128i>& plaintext,
+    const vector<__m128i>& ciphertext,
+    const SM4GCMContext& ctx) {
+    plaintext.resize(ciphertext.size());
+    for (size_t i = 0; i < ciphertext.size(); ++i) {
+        __m128i ctr_blk = get_counter_block(ctx.iv, ctx.counter + i + 1);
+        SM4_enc(ctr_blk, ctx.key); // 解密也使用加密函数
+        plaintext[i] = _mm_xor_si128(ciphertext[i], ctr_blk);
+    }
+}
+
+// 打印128-bit值为hex格式
+void print_m128i_hex(const __m128i& data) {
+    alignas(16) uint8_t bytes[16];
+    _mm_store_si128((__m128i*)bytes, data);
+    for (int i = 0; i < 16; ++i) {
+        cout << hex << setw(2) << setfill('0') << (int)bytes[i] << " ";
+    }
+    cout << dec << endl;
+}
+
+// 随机 __m128i 生成器
+__m128i random_m128i() {
+    alignas(16) uint8_t data[16];
+    for (int i = 0; i < 16; ++i) data[i] = rand() % 256;
+    return _mm_load_si128((__m128i*)data);
+}
+
+int main() {
+    const int BLOCKS = 4;
+    vector<__m128i> plaintexts(BLOCKS);
+    for (auto& b : plaintexts) b = random_m128i();
+
+    SM4GCMContext ctx;
+    ctx.key = random_m128i();
+    ctx.iv = random_m128i();
+    ctx.counter = 0;
+
+    vector<__m128i> ciphertexts, decrypted;
+
+    // 加密
+    auto start = chrono::high_resolution_clock::now();
+    SM4_GCM_encrypt(ciphertexts, plaintexts, ctx);
+    auto end = chrono::high_resolution_clock::now();
+    auto enc_time = chrono::duration_cast<chrono::microseconds>(end - start);
+
+    // 解密
+    auto start1 = chrono::high_resolution_clock::now();
+    SM4_GCM_decrypt(decrypted, ciphertexts, ctx);
+    auto end1 = chrono::high_resolution_clock::now();
+    auto dec_time = chrono::duration_cast<chrono::microseconds>(end1 - start1);
+
+    // 打印
+    cout << "密钥: "; print_m128i_hex(ctx.key);
+    cout << "IV:   "; print_m128i_hex(ctx.iv);
+    for (int i = 0; i < BLOCKS; ++i) {
+        cout << "明文[" << i << "]: "; print_m128i_hex(plaintexts[i]);
+        cout << "密文[" << i << "]: "; print_m128i_hex(ciphertexts[i]);
+        cout << "解密[" << i << "]: "; print_m128i_hex(decrypted[i]);
+    }
+
+    cout << "加密耗时: " << enc_time.count() << " 微秒" << endl;
+    cout << "解密耗时: " << dec_time.count() << " 微秒" << endl;
+
     return 0;
+}
