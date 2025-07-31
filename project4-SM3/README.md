@@ -211,3 +211,225 @@ print("✅ 长度扩展攻击成功！")
 - 如果应用场景中使用 SM3 进行认证（如 MAC）应使用 **HMAC** 而非 `hash(key || message)`。
 
 - 该攻击无法伪造特定 hash，但能伪造合法扩展的数据拼接。
+
+# 基于 SM3 的 RFC 6962 Merkle 树实现及验证证明
+
+---
+
+## 一、背景与应用场景
+
+Merkle 树是一种广泛应用于区块链、透明日志（如 Google CT）、分布式存储中的认证数据结构。RFC 6962 是 Google Certificate Transparency 项目的核心规范，定义了如何使用 Merkle Tree 对证书日志进行高效、可验证地追踪。
+
+本项目使用国密 SM3 哈希算法替代 SHA-256，实现了一个支持：
+- 构造大规模 Merkle 树（10 万节点）
+- 构建单个叶子的存在性证明
+- 构建一个伪造的不存在性证明并验证失败
+
+---
+
+## 二、RFC 6962 Merkle 树结构原理
+
+RFC 6962 中，Merkle 树的构造逻辑如下：
+
+- 所有叶子节点为原始数据的哈希值（叶哈希）。
+- 内部节点为两个子节点哈希值的拼接再哈希。
+- 若叶子为奇数个，则复制最后一个叶子补齐。
+
+**数学定义：**
+
+给定叶子节点集合
+$$
+L = [l_0, l_1, \ldots, l_{n-1}]
+$$
+定义：
+
+- 叶节点哈希：
+  $$
+  H_0(i) = 	ext{Hash}(l_i)
+  $$
+  
+
+- 内部节点哈希递归定义为：
+
+$$
+H(i, j) = 
+\begin{cases}
+H_0(i), & \text{if } j - i = 1 \\
+\text{Hash}(H(i, m) \| H(m, j)), & \text{if } j - i > 1,\ m = \lfloor\frac{i+j}{2}\rfloor
+\end{cases}
+$$
+
+---
+
+## 三、SM3 哈希函数介绍
+
+我们使用开源 `gmssl` 库中的 `sm3_hash` 函数。SM3 是国密标准哈希算法，与 SHA-256 类似，输出 256 位摘要。
+
+```python
+from gmssl import sm3, func
+
+def sm3_hash(data: bytes) -> str:
+    return sm3.sm3_hash(func.bytes_to_list(data))
+```
+
+**输入**：`bytes` 类型数据  
+**输出**：`str` 类型十六进制哈希值
+
+---
+
+## 四、Merkle 树构建函数讲解
+
+### hash_pair 函数：拼接两个哈希后再哈希
+
+```python
+def hash_pair(left: str, right: str) -> str:
+    return sm3_hash(bytes.fromhex(left + right))
+```
+
+解释：
+- `left` 和 `right` 是两个十六进制的 SM3 哈希值
+- 使用 `bytes.fromhex` 拼接成字节串后重新哈希
+
+---
+
+### MerkleTree 构造函数
+
+```python
+class MerkleTree:
+    def __init__(self, leaves: list[bytes]):
+        self.leaves = [sm3_hash(leaf) for leaf in leaves]
+        self.levels = [self.leaves]
+        self.build_tree()
+```
+
+解释：
+- 将所有叶子转为哈希值，初始化第一层
+- 构造 Merkle 树的各层节点
+
+---
+
+### build_tree 函数：自底向上构建整个树
+
+```python
+    def build_tree(self):
+        current = self.leaves
+        while len(current) > 1:
+            next_level = []
+            for i in range(0, len(current), 2):
+                left = current[i]
+                right = current[i + 1] if i + 1 < len(current) else left
+                next_level.append(hash_pair(left, right))
+            self.levels.append(next_level)
+            current = next_level
+```
+
+说明：
+- 每轮构造上一层的父节点
+- 若节点数为奇数，则复制最后一个节点
+
+---
+
+## 五、存在性证明与验证
+
+### get_proof 函数：为指定叶子节点生成路径证明
+
+```python
+    def get_proof(self, index: int) -> list[tuple[str, str]]:
+        proof = []
+        for level in self.levels[:-1]:
+            if index % 2 == 0:
+                sibling_index = index + 1 if index + 1 < len(level) else index
+                proof.append(('R', level[sibling_index]))
+            else:
+                sibling_index = index - 1
+                proof.append(('L', level[sibling_index]))
+            index //= 2
+        return proof
+```
+
+- 每层记录兄弟节点的方向（L 或 R）和哈希值
+- 用于后续的路径验证
+
+---
+
+### verify_proof 函数：重建路径，验证根哈希是否一致
+
+```python
+    @staticmethod
+    def verify_proof(leaf: bytes, proof: list[tuple[str, str]], root: str) -> bool:
+        current = sm3_hash(leaf)
+        for direction, sibling in proof:
+            if direction == 'L':
+                current = hash_pair(sibling, current)
+            else:
+                current = hash_pair(current, sibling)
+        return current == root
+```
+
+说明：
+- 从叶节点开始，与兄弟节点拼接再哈希
+- 最终哈希值是否等于 Merkle 根
+
+---
+
+## 六、不存在性证明与验证
+
+RFC 6962 中不存在性证明依赖于排序和 Merkle Audit Path。这里我们模拟一种攻击场景：
+
+### 伪造不存在的 leaf，使用合法路径验证失败
+
+```python
+    fake_leaf = b"not_in_tree_leaf"
+    fake_proof = proof  # 使用存在的路径
+    is_valid = MerkleTree.verify_proof(fake_leaf, fake_proof, root)
+    print(f"验证不存在的叶子 '{fake_leaf.decode()}' 是否存在于树中: {is_valid}")
+```
+
+- 使用与某叶子相同的路径（攻击者构造）
+- 替换为另一个数据进行验证应返回 `False`
+
+---
+
+## 七、完整测试与实验结果
+
+```python
+if __name__ == "__main__":
+    leaf_count = 100000
+    leaves = [f"leaf{i}".encode() for i in range(leaf_count)]
+    tree = MerkleTree(leaves)
+    root = tree.get_root()
+    print(f"✅ 构建 Merkle 树成功，根为: {root}")
+
+    index = random.randint(0, leaf_count - 1)
+    proof = tree.get_proof(index)
+    leaf = leaves[index]
+    result = MerkleTree.verify_proof(leaf, proof, root)
+    print(f"验证 leaf[{index}] = {leaf.decode()} 是否存在: {result}")
+
+    fake_leaf = b"not_in_tree_leaf"
+    fake_proof = proof
+    is_valid = MerkleTree.verify_proof(fake_leaf, fake_proof, root)
+    print(f"验证不存在的叶子 '{fake_leaf.decode()}' 是否存在于树中: {is_valid}")
+```
+
+示例输出：
+
+```
+✅ 构建 Merkle 树成功，根为: 15ddfec7212cbdc02390a700f82ea5e2ba8d7c71e062d3b2c556f05c80bceeac
+验证 leaf[93396] = leaf93396 是否存在: True
+验证不存在的叶子 'not_in_tree_leaf' 是否存在于树中: False
+```
+
+---
+
+## ✅ 总结
+
+| 项目        | 内容                                     |
+|-------------|------------------------------------------|
+| 哈希算法    | SM3，输出长度 256 位                    |
+| Merkle 树深度 | 对于 100000 个叶子，约为 log₂(100000) ≈ 17 |
+| 路径长度    | 存在性证明约为 17 步                     |
+| 安全性      | 依赖哈希抗碰撞性，无法伪造有效路径       |
+| 不存在性验证 | 模拟攻击时验证失败                       |
+
+---
